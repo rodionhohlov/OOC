@@ -13,208 +13,276 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/wait.h>
-#include <time.h>
 
+#define USER_ID_LEN 32
 #define MESSAGE_LEN 256
-#define ID_LEN 32
+#define CONTEXT_LEN 512
+#define FILENAME    "messages.dat"
 
-const char filename[] = "transit.txt";
+enum spec_values_t {
+    UNREAD = 0,
+    READ   = 1
+};
 
 typedef struct {
-    char sender_id[ID_LEN];
-    char reciever_id[ID_LEN];
-    bool status;
-    char message_text[MESSAGE_LEN];
-    int message_id;
-} message_context_t;
+    char   sender_id[USER_ID_LEN];
+    char   receiver_id[USER_ID_LEN];
+    char   message_text[MESSAGE_LEN];
+    int    is_read_flag;
+    time_t send_time;
+    long   message_id;
+} message_context;
 
-void init_file_if_need (void);
+static volatile sig_atomic_t stop_flag = 0;
 
-void clean_transit_file (void);
+// ----------------------------funcs-----------------------------
 
-void reader_process(const char* my_id);
+void WriterProcess(const char *my_id, const char *filename);
 
-void writer_process(const char* my_id);
+void ReaderProcess(const char *my_id, const char *filename);
 
-int lock_file(int fd, int type);
+void OnSignal (int sig);
 
-int main (int argc, char* argv[]) {
+// ---------------------------- main ---------------------------- 
+int main(int argc, char *argv[]) {
 
     if (argc < 2) {
-        perror("user_id is undefined\n");
-        exit(1);
+        fprintf(stderr, "Использование: %s <ID_терминала>\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    char my_id[ID_LEN];
-    snprintf(my_id, sizeof(my_id), "%s", argv[1]);
-
-    init_file_if_need();
-    clean_transit_file();
-
-    pid_t process_id = fork();
-
-    if (process_id < 0) {
-        perror("process init error\n");
-        exit(1);
+    if (strlen(argv[1]) >= USER_ID_LEN) {
+        fprintf(stderr, "ID слишком длинный (max %d)\n", USER_ID_LEN - 1);
+        return EXIT_FAILURE;
     }
-    else if (process_id == 0) {
-        reader_process(my_id);
+
+    const char *my_id    = argv[1];
+    const char *filename = FILENAME;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return EXIT_FAILURE;
     }
-    else {
-        writer_process(my_id);
-        wait(NULL);
-    }
+
+    if (pid == 0) {
     
-    return 0;
-}
-
-void init_file_if_need (void) {
-    int file_id = open(filename, O_CREAT | O_RDWR, 0666);
-
-    if (file_id < 0) {
-        perror("file opening failed\n");
-        exit(1);
+        ReaderProcess(my_id, filename);
+        _exit(EXIT_SUCCESS);
     }
 
-    close(file_id);
+    WriterProcess(my_id, filename);
+
+    kill(pid, SIGTERM); //уничножение созданного ранее процесса
+
+    if (waitpid(pid, NULL, 0) < 0) {
+        perror("waitpid");
+    }
+
+    printf("Завершение работы.\n");
+    return EXIT_SUCCESS;
 }
 
-void clean_transit_file(void) {
-    int fd = open(filename, O_RDWR | O_CREAT, 0666);
+void OnSignal (int sig) {
+    (void)sig;
+    stop_flag = 1;
+}
 
-    if (fd < 0) {
-        perror("opening file for cleaning failed\n");
+void WriterProcess (const char *my_id, const char *filename) {
+
+    if(my_id == NULL || filename == NULL) {
+        fprintf(stderr, "Ошибка передечи аргуменов в writer_process\n");
         return;
     }
-
-    lock_file(fd, F_WRLCK);
-
-    message_context_t messages[1000];
-    int count = 0;
-
-    while (read(fd, &messages[count], sizeof(message_context_t)) == sizeof(message_context_t)) {
-        if (messages[count].status == false) {
-            count++;
-        }
-        if (count >= 1000) break;
-    }
-
-    ftruncate(fd, 0);
-    lseek(fd, 0, SEEK_SET);
-
-    for (int i = 0; i < count; i++) {
-        write(fd, &messages[i], sizeof(message_context_t));
-    }
-
-    lock_file(fd, F_UNLCK);
-    close(fd);
-}
-
-int lock_file(int fd, int type) {
-    struct flock fl;
-    fl.l_type = type;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-    return fcntl(fd, F_SETLKW, &fl);
-}
-
-void reader_process(const char* my_id) {
     
     int fd = open(filename, O_RDWR | O_CREAT, 0666);
 
     if (fd < 0) {
-        perror("file opening failed in mode reading\n");
-        exit(1);
+        perror("ошибка создания файла");
+        exit(EXIT_FAILURE);
     }
 
-    while (true) {
-        lock_file(fd, F_WRLCK);
+    printf("Writer (ID %s). Вводите: <ID_получателя> <текст>\n", my_id);
+    printf("Для выхода нажмите Ctrl+D.\n");
 
-        lseek(fd, 0, SEEK_SET);
+    char line[CONTEXT_LEN];
+    ssize_t n = 0;
 
-        message_context_t message = {};
-        off_t offset = 0;
+    while ((n = read(STDIN_FILENO, line, sizeof(line) - 1)) > 0) {
+        line[n] = '\0';
 
-        while (read(fd, &message, sizeof(message_context_t)) == sizeof(message_context_t)) {
+        char *nl = strchr(line, '\n');
 
-            if (strcmp(message.reciever_id, my_id) == 0 && message.status == false) {
-
-                printf("\n[message from %s]: %s\n> ", message.sender_id, message.message_text);
-                fflush(stdout);
-
-                message.status = true;
-                lseek(fd, offset, SEEK_SET);
-                write(fd, &message, sizeof(message_context_t));
-                
-                lseek(fd, offset + sizeof(message_context_t), SEEK_SET);
-            }
-
-            offset = lseek(fd, 0, SEEK_CUR);
+        if (nl != NULL) {
+            *nl = '\0';
         }
 
-        lock_file(fd, F_UNLCK);
-        sleep(1);
-    }
-
-    close(fd);
-}
-
-void writer_process(const char* my_id) {
-    int fd = open(filename, O_RDWR | O_CREAT, 0666);
-
-    if (fd < 0) {
-        perror("opening file error\n");
-        exit(1);
-    }
-
-    char input_line[MESSAGE_LEN + ID_LEN + 32];
-    char recipient[ID_LEN];
-    char text[MESSAGE_LEN];
-
-    printf("\nuser %s is ready.\n", my_id);
-    printf("please, write down: <recipient> <message>\n> ");
-    fflush(stdout);
-
-    while (fgets(input_line, sizeof(input_line), stdin) != NULL) {
-    
-        input_line[strcspn(input_line, "\n")] = 0;
-
-        if (strlen(input_line) == 0) {
-            printf("> ");
-            fflush(stdout);
+        if (line[0] == '\0') {
             continue;
         }
 
-        int parsed = sscanf(input_line, "%31s %[^\n]", recipient, text);
-        
-        if (parsed < 2) {
-            printf("Error: format should be <recipient> <message>\n> ");
-        } else {
-            message_context_t msg = {0};
+        char recipient[USER_ID_LEN] = {0};
+        char text[MESSAGE_LEN]      = {0};
 
-            snprintf(msg.sender_id, ID_LEN, "%s", my_id);
-            snprintf(msg.reciever_id, ID_LEN, "%s", recipient);
-            msg.status = false;
-            msg.message_id = (int)(time(NULL) ^ getpid()); 
-            snprintf(msg.message_text, MESSAGE_LEN, "%s", text);
-
-            lock_file(fd, F_WRLCK);
-            lseek(fd, 0, SEEK_END);
-            write(fd, &msg, sizeof(message_context_t));
-            lock_file(fd, F_UNLCK);
+        if (sscanf(line, "%31s %255[^\n]", recipient, text) != 2) {
+            printf("Формат: <ID_получателя> <текст>\n");
+            continue;
         }
 
-        printf("> ");
-        fflush(stdout);
+        message_context msg = {};
+
+        time_t now = time (NULL);
+
+        msg.message_id = (long) now * 100000 + (getpid() % 100000);
+        strncpy(msg.sender_id,   my_id,     USER_ID_LEN - 1);
+        strncpy(msg.receiver_id, recipient, USER_ID_LEN - 1);
+        strncpy(msg.message_text, text,     MESSAGE_LEN - 1);
+        msg.send_time    = now;
+        msg.is_read_flag = UNREAD;
+
+        if (flock(fd, LOCK_EX) < 0) {
+            perror("ошибка flock"); 
+        }
+
+        if (lseek(fd, 0, SEEK_END) < 0) {
+            perror("ошибка lseek");
+        }
+
+        if (write(fd, &msg, sizeof(msg)) != (ssize_t)sizeof(msg)) {
+            perror("ошибка write");
+        }
+
+        if (flock(fd, LOCK_UN) < 0) {
+            perror("ошибка flock");
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+
+        printf("Отправлено %s: %s\n", recipient, text);
     }
 
-    close(fd);
+    if (close(fd) < 0) {
+        perror("ошибка закрытия файла");
+    }
+}
+
+void ReaderProcess (const char *my_id, const char *filename) {
+
+    if (my_id == NULL || filename == NULL) {
+        fprintf(stderr, "Ошибка передечи аргуменов в reader_process\n");
+        return;
+    }
+
+    signal(SIGTERM, OnSignal);
+    signal(SIGINT,  OnSignal);
+
+    int fd = open(filename, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        perror("open");
+        exit(EXIT_FAILURE);
+    }
+
+    while (!stop_flag) {
+        if (flock(fd, LOCK_EX) < 0) { 
+            perror("ошибка flock"); 
+            break;
+        }
+
+        message_context *arr = NULL;
+        size_t count = 0, cap = 0;
+        message_context msg;
+
+        if (lseek(fd, 0, SEEK_SET) < 0) perror("lseek");
+
+        ssize_t n;
+
+        while ((n = read(fd, &msg, sizeof(msg))) == (ssize_t)sizeof(msg)) {
+            if (count == cap) {
+
+                if (cap == 0) {
+                    cap = 16;
+                } else {
+                    cap *= 2;
+                }
+
+                message_context *tmp = realloc(arr, cap * sizeof(message_context));
+
+                if (!tmp) { 
+                    perror("ошибка realloc"); 
+                    break; 
+                }
+
+                arr = tmp;
+            }
+
+            arr[count++] = msg;
+        }
+
+        int need_cleanup = 0;
+
+        for (size_t i = 0; i < count; i++) {
+
+            if (arr[i].is_read_flag == READ) {
+                need_cleanup = 1;
+            }
+
+            if (strcmp(arr[i].receiver_id, my_id) == 0 && arr[i].is_read_flag == UNREAD) {
+
+                char timebuf[64];
+                struct tm *tm_info = localtime(&arr[i].send_time);
+
+                strftime(timebuf, sizeof(timebuf), "%H:%M:%S", tm_info);
+
+                printf("\n[%s] от %s: %s\n",
+                       timebuf, arr[i].sender_id, arr[i].message_text);
+                fflush(stdout);
+
+                arr[i].is_read_flag = READ;
+                need_cleanup = 1;
+            }
+        }
+
+        if (need_cleanup) {
+            if (lseek(fd, 0, SEEK_SET) < 0) {
+                perror("lseek");
+            }
+
+            size_t new_count = 0;
+            for (size_t i = 0; i < count; i++) {
+                if (arr[i].is_read_flag == UNREAD) {
+                    if (write(fd, &arr[i], sizeof(message_context))
+                        != (ssize_t)sizeof(message_context)) {
+                        perror("write");
+                    }
+                    new_count++;
+                }
+            }
+            if (ftruncate(fd, (off_t)(new_count * sizeof(message_context))) < 0) {
+                perror("ftruncate");
+            }
+        }
+
+        free(arr);
+
+        if (flock(fd, LOCK_UN) < 0) {
+            perror("flock");
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < 10 && !stop_flag; i++) {
+            usleep(100000);
+        }
+    }
+
+    if (close(fd) < 0) perror("close");
 }
